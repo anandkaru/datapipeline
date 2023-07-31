@@ -44,23 +44,47 @@ client = storage.Client.from_service_account_json(json_credentials_path=path_to_
 
 bucket = storage.Bucket(client, 'saas-labs-staging-rndaip-qs1h0h8x')
 
-def upload_folder_to_bucket(folder_path):
-    for root, dirs, files in os.walk(folder_path):
-        for file_name in files:
-            file_path = os.path.join(root, file_name)
-            # Create the blob path based on the folder structure
-            blob_path = os.path.relpath(file_path, folder_path)
-            blob = bucket.blob(blob_path)
-            blob.upload_from_filename(file_path)
-            os.remove(file_path)
+def upload_folder_to_bucket(source_folder, destination_folder):
+  
 
-def download_folder_from_bucket(folder_id, local_folder_path):
-    blobs = bucket.list_blobs(prefix=folder_id + '/')
+    # Iterate through the files in the source folder
+    for root, _, files in os.walk(source_folder):
+        for file_name in files:
+            # Create the full local path to the file
+            local_file_path = os.path.join(root, file_name)
+
+            # Create the corresponding blob name in the destination folder of the bucket
+            blob_name = os.path.join(destination_folder, file_name)
+
+            # Upload the file to the bucket
+            blob = bucket.blob(blob_name)
+            blob.upload_from_filename(local_file_path)
+
+            print(f"Uploaded {local_file_path} to gs:/{blob_name}")
+
+
+def download_folder_from_bucket( source_folder, destination_folder):
+   
+
+    # Get a list of blobs in the specified source folder
+    blobs = bucket.list_blobs(prefix=source_folder)
+
+    # Iterate through the blobs and download each file
     for blob in blobs:
-        relative_blob_path = os.path.relpath(blob.name, folder_id)
-        local_file_path = os.path.join(local_folder_path, relative_blob_path)
+        # Get the relative path of the file inside the source folder
+        relative_path = os.path.relpath(blob.name, source_folder)
+
+        # Create the local file path where the file will be downloaded
+        local_file_path = os.path.join(destination_folder, relative_path)
+
+        # Create the directories if they don't exist
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+
+        # Download the file from the bucket to the local file path
         blob.download_to_filename(local_file_path)
+
+        print(f"Downloaded gs://{blob.name} to {local_file_path}")
+
 
 def clean_data_to_format(data,source):
     if source.lower()=='jira':
