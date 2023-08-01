@@ -11,7 +11,7 @@ from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS
 from langchain.document_loaders import UnstructuredURLLoader, DirectoryLoader, TextLoader
-
+import time
 from data_clean import clean_jira, clean_intercom
 
 client_url = config('CONNECTION_URL')
@@ -38,59 +38,49 @@ def get_data(sourceid):
 
 from google.cloud import storage
 
-bucket_path = 'agent-assist-embeddings/'
+bucket_path = 'cai-embeddings/'
 path_to_private_key = './saas-labs-staging-rnd-0affa0ea1703.json'
 client = storage.Client.from_service_account_json(json_credentials_path=path_to_private_key)
 
 bucket = storage.Bucket(client, 'saas-labs-staging-rndaip-qs1h0h8x')
 
-def upload_folder_to_bucket(source_folder, destination_folder):
-  
-
-    # Iterate through the files in the source folder
-    for root, _, files in os.walk(source_folder):
+def upload_folder_to_bucket(foldername):
+    for root, _, files in os.walk(foldername):
         for file_name in files:
-            # Create the full local path to the file
             local_file_path = os.path.join(root, file_name)
-
-            # Create the corresponding blob name in the destination folder of the bucket
-            blob_name = os.path.join(destination_folder, file_name)
-
-            # Upload the file to the bucket
+            blob_name = os.path.join(foldername, file_name)
             blob = bucket.blob(blob_name)
             blob.upload_from_filename(local_file_path)
-
             print(f"Uploaded {local_file_path} to gs:/{blob_name}")
+    shutil.rmtree(foldername)
+    print(f"Removed local folder: {foldername}")
 
-
-def download_folder_from_bucket( source_folder, destination_folder):
-   
-
-    # Get a list of blobs in the specified source folder
-    blobs = bucket.list_blobs(prefix=source_folder)
-
-    # Iterate through the blobs and download each file
+def download_folder_from_bucket(foldername):
+    blobs = bucket.list_blobs(prefix=foldername)
     for blob in blobs:
-        # Get the relative path of the file inside the source folder
-        relative_path = os.path.relpath(blob.name, source_folder)
-
-        # Create the local file path where the file will be downloaded
-        local_file_path = os.path.join(destination_folder, relative_path)
-
-        # Create the directories if they don't exist
+        relative_path = os.path.relpath(blob.name, foldername)
+        local_file_path = os.path.join(foldername, relative_path)
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-
-        # Download the file from the bucket to the local file path
         blob.download_to_filename(local_file_path)
-
         print(f"Downloaded gs://{blob.name} to {local_file_path}")
 
+def upload_file_to_bucket(filename):
+    path = bucket_path+filename
+    blob = bucket.blob(path)
+    blob.upload_from_filename(filename)
+    os.remove(filename)
 
-def clean_data_to_format(data,source):
+def download_file_from_bucket(filename):
+    blob = bucket.blob(filename)
+    local_file_path=filename+"(duplicate)"
+    blob.download_to_filename(local_file_path)
+    print(f"Downloaded gs://{blob.name} to {local_file_path}")
+    
+def clean_data_to_format(data,source,sourceid):
     if source.lower()=='jira':
-        cleaned_data=clean_jira(data)
+        cleaned_data=clean_jira(data,sourceid)
     elif source.lower()=='intercom':
-        cleaned_data=clean_intercom(data)
+        cleaned_data=clean_intercom(data,sourceid)
     else:
         return {"message":"Source not found"}
     return cleaned_data
@@ -112,9 +102,10 @@ embeddings = HuggingFaceEmbeddings(
     encode_kwargs=encode_kwargs
 )
 
-def save_embeddings(id):
+def save_embeddings(filename):
     # DRIVE_FOLDER = "/content/drive/MyDrive/lang_data/Real_jsons"
-    DRIVE_FOLDER = "/content/drive/MyDrive/lang_data"
+    # DRIVE_FOLDER = "/content/drive/MyDrive/lang_data"
+    DRIVE_FOLDER = bucket_path+filename
     loader_json = DirectoryLoader(DRIVE_FOLDER, glob='**/*.json', show_progress=True, loader_cls=TextLoader)
     loaders = [loader_json]
     documents = []
@@ -123,7 +114,8 @@ def save_embeddings(id):
     char_text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
     split_docs = char_text_splitter.split_documents(documents)
     vector_store = FAISS.from_documents(split_docs, embeddings)
-    folder_path = path + str(id) + "_faiss_index"
+    flnm = filename.split(".")[0]
+    folder_path = path + flnm + "_faiss_index"
     vector_store.save_local(folder_path)
     print("Embeddings saved")
     return folder_path
@@ -154,10 +146,11 @@ async def saving(request: Request):
     source = body['source']  
     sourceid = get_id(companyid,source)
     data = get_data(sourceid)
-    cleaned_data = clean_data_to_format(data,source)
-    #upload_json_to_bucket(json_path)
-    ##wait_5s
-    folder_path = save_embeddings(id)
+    cleaned_data, filename = clean_data_to_format(data,source)
+    upload_file_to_bucket(filename)
+    ##upload_data_to_mongo(cleaned_data)
+    time.sleep(5)
+    folder_path = save_embeddings(filename)
     upload_folder_to_bucket(folder_path)
 
 @app.post('/contextai/update')
@@ -167,8 +160,10 @@ async def update(request: Request):
     source = body['source'] 
     sourceid = get_id(companyid,source)
     data = get_data(sourceid)
-    cleaned_data = clean_data_to_format(data,source)
-    #upload_json_to_bucket(json_path)
+    cleaned_data, filename = clean_data_to_format(data,source,sourceid)
+    download_file_from_bucket(filename)
+    ##merge_data
+    upload_file_to_bucket(filename)###merge
     ##wait_5s
     # folder_path = save_embeddings(id)
     download_folder_from_bucket(id,'./')
