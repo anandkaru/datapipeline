@@ -1,8 +1,8 @@
 import json 
 
-def clean_intercom(data,sourceid):
+def clean_intercom(data,sourceid,i):
     intercom_json={}
-    i=1
+    # i=1
     for item in data:
         intercom_json[f"conversation {i} type"]= item['type']
         intercom_json[f"conversation {i} source delivered_as"]= item['source']['delivered_as']
@@ -41,11 +41,11 @@ def clean_intercom(data,sourceid):
         outfile.write(json_object)
     return intercom_json, filename
 
-def clean_jira(data,sourceid):
+def clean_jira(data,sourceid,i):
     jira_json={}
 
     jira_json["total issues"]= data['total']
-    i=1
+    # i=1
     for item in data["issues"]:
         if item['fields']['resolution'] is not None:
             jira_json[f"issue: {i} resolution description"]= item['fields']['resolution']['description']

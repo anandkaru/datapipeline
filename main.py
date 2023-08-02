@@ -12,6 +12,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS
 from langchain.document_loaders import UnstructuredURLLoader, DirectoryLoader, TextLoader
 import time
+import json
 from data_clean import clean_jira, clean_intercom
 
 client_url = config('CONNECTION_URL')
@@ -72,21 +73,21 @@ def upload_file_to_bucket(filename):
 
 def download_file_from_bucket(filename):
     blob = bucket.blob(filename)
-    local_file_path=filename+"(duplicate)"
+    local_file_path=filename+"_duplicate"
     blob.download_to_filename(local_file_path)
     print(f"Downloaded gs://{blob.name} to {local_file_path}")
+    return local_file_path
     
-def clean_data_to_format(data,source,sourceid):
+def clean_data_to_format(data,source,sourceid,i):
     if source.lower()=='jira':
-        cleaned_data=clean_jira(data,sourceid)
+        cleaned_data=clean_jira(data,sourceid,i)
     elif source.lower()=='intercom':
-        cleaned_data=clean_intercom(data,sourceid)
+        cleaned_data=clean_intercom(data,sourceid,i)
     else:
         return {"message":"Source not found"}
     return cleaned_data
 
-
-path = "./store/"
+# path = "./store/"
 
 chain_collection={}
 
@@ -97,7 +98,7 @@ encode_kwargs = {'normalize_embeddings': False}
 
 embeddings = HuggingFaceEmbeddings(
     model_name=model_name,
-    cache_folder=path,
+    cache_folder='./embeddings',
     model_kwargs=model_kwargs,
     encode_kwargs=encode_kwargs
 )
@@ -148,10 +149,9 @@ async def saving(request: Request):
     source = body['source']  
     sourceid = str(get_id(companyid,source))
     data = get_data(sourceid)
-    cleaned_data, filename = clean_data_to_format(data,source)
-    upload_file_to_bucket(filename)
+    cleaned_data, filename = clean_data_to_format(data,source,sourceid,i=1)
     ##upload_data_to_mongo(cleaned_data)
-    # time.sleep(5)
+    upload_file_to_bucket(filename)
     folder_path = save_embeddings(sourceid,'./jsons/')
     upload_folder_to_bucket(folder_path)
 
@@ -162,18 +162,21 @@ async def update(request: Request):
     source = body['source'] 
     sourceid = str(get_id(companyid,source))
     data = get_data(sourceid)
-    cleaned_data, filename = clean_data_to_format(data,source,sourceid)
+    duplicate_path = download_file_from_bucket(filename)
+    f = open(duplicate_path)
+    older_data = json.loads(f)
+    f.close()
+    i = older_data.keys()[-1].split(" ")[1]
+    cleaned_data, filename = clean_data_to_format(data,source,sourceid,i+1)
     folderpath = save_embeddings(sourceid,'./jsons/')
     local_folder = sourceid+'_temp'
     bucket_folder = sourceid + "_faiss_index"
     download_folder_from_bucket(bucket_folder,local_folder)
     folderpath = merge(local_folder,folderpath)
     upload_folder_to_bucket(folderpath)
-    download_file_from_bucket(filename)
-    # merge_data
-    upload_file_to_bucket(filename)###merge
-    ##upload_data_to_mongo(cleaned_data)
-    ##wait_5s
-    # folder_path = save_embeddings(id)
-    
-    # merge(cleaned_data,'./'+id+'_faiss_index')
+    merged_data = {**older_data, **cleaned_data}
+    with open(filename, 'w') as file:
+        json.dumps(merged_data, file, indent=4)
+    os.remove(duplicate_path)
+    ##upload_data_to_mongo(merged_data)
+    upload_file_to_bucket(filename)
