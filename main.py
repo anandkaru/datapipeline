@@ -55,11 +55,11 @@ def upload_folder_to_bucket(foldername):
     shutil.rmtree(foldername)
     print(f"Removed local folder: {foldername}")
 
-def download_folder_from_bucket(foldername):
+def download_folder_from_bucket(foldername, local_folder):
     blobs = bucket.list_blobs(prefix=foldername)
     for blob in blobs:
         relative_path = os.path.relpath(blob.name, foldername)
-        local_file_path = os.path.join(foldername, relative_path)
+        local_file_path = os.path.join(local_folder, relative_path)
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
         blob.download_to_filename(local_file_path)
         print(f"Downloaded gs://{blob.name} to {local_file_path}")
@@ -102,10 +102,10 @@ embeddings = HuggingFaceEmbeddings(
     encode_kwargs=encode_kwargs
 )
 
-def save_embeddings(filename):
+def save_embeddings(sourceid,localpath):
     # DRIVE_FOLDER = "/content/drive/MyDrive/lang_data/Real_jsons"
     # DRIVE_FOLDER = "/content/drive/MyDrive/lang_data"
-    DRIVE_FOLDER = bucket_path+filename
+    DRIVE_FOLDER =localpath
     loader_json = DirectoryLoader(DRIVE_FOLDER, glob='**/*.json', show_progress=True, loader_cls=TextLoader)
     loaders = [loader_json]
     documents = []
@@ -114,22 +114,24 @@ def save_embeddings(filename):
     char_text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
     split_docs = char_text_splitter.split_documents(documents)
     vector_store = FAISS.from_documents(split_docs, embeddings)
-    flnm = filename.split(".")[0]
-    folder_path = path + flnm + "_faiss_index"
+    # flnm = filename.split(".")[0]
+    folder_path = sourceid + "_faiss_index"
     vector_store.save_local(folder_path)
     print("Embeddings saved")
+    shutil.rmtree(localpath)
     return folder_path
 
-def merge(data,path):
-  db1 = FAISS.load_local(path + str(id) + "_faiss_index", embeddings)
-  db2 = FAISS.from_documents(data, embeddings)
+def merge(localpath,folderpath):
+  db1 = FAISS.load_local(localpath, embeddings)
+  db2 = FAISS.load_local(folderpath, embeddings)
   db1.merge_from(db2)
   try:
-      shutil.rmtree(path + str(id) + "_faiss_index")
+      shutil.rmtree(localpath)
+      shutil.rmtree(folderpath)
   except OSError as e:
       print("Error: %s - %s." % (e.filename, e.strerror))
-  db1.save_local(path + str(id) + "_faiss_index")
-  return 
+  db1.save_local(folderpath)
+  return folderpath
 
 from fastapi import FastAPI, Request
 
@@ -144,13 +146,13 @@ async def saving(request: Request):
     body = await request.json()  
     companyid = body['companyid']  
     source = body['source']  
-    sourceid = get_id(companyid,source)
+    sourceid = str(get_id(companyid,source))
     data = get_data(sourceid)
     cleaned_data, filename = clean_data_to_format(data,source)
     upload_file_to_bucket(filename)
     ##upload_data_to_mongo(cleaned_data)
-    time.sleep(5)
-    folder_path = save_embeddings(filename)
+    # time.sleep(5)
+    folder_path = save_embeddings(sourceid,'./jsons/')
     upload_folder_to_bucket(folder_path)
 
 @app.post('/contextai/update')
@@ -158,14 +160,20 @@ async def update(request: Request):
     body = await request.json() 
     companyid = body['companyid']  
     source = body['source'] 
-    sourceid = get_id(companyid,source)
+    sourceid = str(get_id(companyid,source))
     data = get_data(sourceid)
     cleaned_data, filename = clean_data_to_format(data,source,sourceid)
+    folderpath = save_embeddings(sourceid,'./jsons/')
+    local_folder = sourceid+'_temp'
+    bucket_folder = sourceid + "_faiss_index"
+    download_folder_from_bucket(bucket_folder,local_folder)
+    folderpath = merge(local_folder,folderpath)
+    upload_folder_to_bucket(folderpath)
     download_file_from_bucket(filename)
-    ##merge_data
+    # merge_data
     upload_file_to_bucket(filename)###merge
+    ##upload_data_to_mongo(cleaned_data)
     ##wait_5s
     # folder_path = save_embeddings(id)
-    download_folder_from_bucket(id,'./')
-    merge(cleaned_data,'./'+id+'_faiss_index')
-    upload_folder_to_bucket('./'+id+'_faiss_index')
+    
+    # merge(cleaned_data,'./'+id+'_faiss_index')

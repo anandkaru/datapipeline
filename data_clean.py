@@ -36,10 +36,10 @@ def clean_intercom(data,sourceid):
             j=j+1
         i=i+1
     json_object = json.dumps(intercom_json, indent=4)
-
-    with open(str(sourceid)+"intercom_single.json", "a") as outfile:
+    filename = './jsons/'+str(sourceid)+"_intercom_single.json"
+    with open(filename, "a") as outfile:
         outfile.write(json_object)
-    return intercom_json, str(sourceid)+"intercom_single.json"
+    return intercom_json, filename
 
 def clean_jira(data,sourceid):
     jira_json={}
@@ -105,7 +105,7 @@ def clean_jira(data,sourceid):
 
     # json_object = json.dumps(jira_json, indent=4)
     json_object = json.dumps(jira_json, indent=4)
-
-    with open(str(sourceid)+"jira_json.json", "a") as outfile:
+    filepath='./jsons/'+str(sourceid)+"_jira_json.json"
+    with open(filepath, "a") as outfile:
         outfile.write(json_object)
-    return jira_json, str(sourceid)+"jira_json.json"
+    return jira_json, filepath
