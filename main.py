@@ -1,101 +1,157 @@
 import pymongo
 import os
-import io
-import numpy as np
-from decouple import config
-import numpy as np
 import shutil
+
 from sentence_transformers import SentenceTransformer
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS
-from langchain.document_loaders import UnstructuredURLLoader, DirectoryLoader, TextLoader
-import time
+from langchain.document_loaders import DirectoryLoader, TextLoader
+from langchain.chat_models import ChatOpenAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
+from langchain.callbacks import get_openai_callback
+
+import logging
 import json
-import uvicorn
-from data_clean import clean_jira, clean_intercom
+from decouple import config
+
+# from bson.objectid import ObjectId
+
+from data_clean import clean_intercom, clean_jira, clean_meet, clean_zoom
+
+
+os.environ["OPENAI_API_KEY"] = config('OPENAI_API_KEY')
 
 client_url = config('CONNECTION_URL')
 client = pymongo.MongoClient(client_url)
 print("client ready")
 
-db = client['aimodels']
-collection1 = db['ids']
-collection2 = db['data']
+db = client['cai']
+# collection1 = db['ids']
+collection2 = db['intercom_data']
+target_data_collection = db['embedding_jsons']
 
-def get_id(companyid,source):
-    query = {"companyid": companyid}
-    result = collection1.find_one(query)
-    if result:
-        sourceid = result[source]
-        return sourceid
+# def get_id(companyid,source):
+#     query = {"companyid": companyid}
+#     result = collection1.find_one(query)
+#     if result:
+#         sourceid = result[source]
+#         return sourceid
+#     else:
+#         print("Document not found.")
+
+def get_data(companyid,customerid):
+    query = {'companyid':companyid,'customerid':customerid}
+    result = collection2.find(query)
+    data_final=[]
+    for ele in result:
+        data = ele['data']
+        data_final.append(data)
+    path = companyid+'/'+customerid+'/'
+    return data_final,path
+
+def mongo_format(foldername):
+    file_list = [f for f in os.listdir(foldername) if f.endswith('.json')]
+    data_list=[]
+    for filename in file_list:
+        filepath = os.path.join(foldername, filename)
+        
+        with open(filepath, 'r') as f:
+            json_data = f.read()
+        json_data = json.loads(json_data)
+            
+        data_list.append({
+            "source": filename[:-5],  # Remove the '.json' extension
+            "data": json_data
+        })
+
+    return data_list
+
+def mongo_update(companyid, customerid, data):
+    complete_data = {
+        "companyid": companyid,
+        "customerid": customerid,
+        "data": data
+    }
+    query = {'companyid':companyid,'customerid':customerid}
+    existing_data = target_data_collection.find_one(query)
+    if existing_data:
+        target_data_collection.replace_one(query, complete_data)
     else:
-        print("Document not found.")
-
-def get_data(sourceid):
-    query = {"_id": sourceid}
-    result = collection2.find_one(query)
-    return result
+        target_data_collection.insert_one(complete_data)
 
 from google.cloud import storage
 
-bucket_path = 'cai-embeddings/'
-path_to_private_key = './saas-labs-staging-rnd-0affa0ea1703.json'
+bucket_path_embeddings = 'cai-embeddings/'
+bucket_path_jsons = 'cai-jsons/'
+path_to_private_key = './creds.json'
 client = storage.Client.from_service_account_json(json_credentials_path=path_to_private_key)
 
 bucket = storage.Bucket(client, 'saas-labs-staging-rndaip-qs1h0h8x')
 
-def upload_folder_to_bucket(foldername):
+def upload_folder_to_bucket(foldername,bucket_path):
     for root, _, files in os.walk(foldername):
         for file_name in files:
             local_file_path = os.path.join(root, file_name)
-            blob_name = os.path.join(foldername, file_name)
+            blob_name = os.path.join(bucket_path+foldername, file_name)
             blob = bucket.blob(blob_name)
             blob.upload_from_filename(local_file_path)
             print(f"Uploaded {local_file_path} to gs:/{blob_name}")
-    shutil.rmtree(foldername)
+    delete = foldername.split('/')
+    shutil.rmtree(delete[0])
     print(f"Removed local folder: {foldername}")
 
-def download_folder_from_bucket(foldername, local_folder):
-    blobs = bucket.list_blobs(prefix=foldername)
-    for blob in blobs:
-        relative_path = os.path.relpath(blob.name, foldername)
-        local_file_path = os.path.join(local_folder, relative_path)
-        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-        blob.download_to_filename(local_file_path)
-        print(f"Downloaded gs://{blob.name} to {local_file_path}")
-
-def upload_file_to_bucket(filename):
-    path = bucket_path+filename
+def upload_file_to_bucket(filepath,bucket_path):
+    path = bucket_path+filepath[2:]
     blob = bucket.blob(path)
-    blob.upload_from_filename(filename)
-    os.remove(filename)
+    blob.upload_from_filename(filepath)
+    os.remove(filepath)
+    print(f"Uploaded local file: {filepath}")
 
-def download_file_from_bucket(filename):
-    blob = bucket.blob(filename)
-    local_file_path=filename+"_duplicate"
-    blob.download_to_filename(local_file_path)
-    print(f"Downloaded gs://{blob.name} to {local_file_path}")
-    return local_file_path
+def download_jsons_folder_from_bucket(foldername, bucket_path):
+  blobs = bucket.list_blobs(prefix=bucket_path+foldername)
+  for blob in blobs:
+      relative_path = os.path.relpath(blob.name, foldername)
+      arr = relative_path.split("/")
+      # path = arr[-2]
+      relative_path = '/'.join(arr[3:])
+      print(relative_path)
+      os.makedirs(foldername, exist_ok=True)
+      blob.download_to_filename(relative_path)
+      print(f"Downloaded gs://{blob.name} to {relative_path}")
+
+def download_embeddings_folder_from_bucket(foldername,bucket_path):
+  blobs = bucket.list_blobs(prefix=bucket_path+foldername)
+  for blob in blobs:
+      relative_path = os.path.relpath(blob.name, foldername)
+      arr = relative_path.split("/")
+      make_path = arr[-2]
+      relative_path = '/'.join(arr[-2:])
+      print(relative_path)
+      os.makedirs(make_path, exist_ok=True)
+      blob.download_to_filename(relative_path)
+      print(f"Downloaded gs://{blob.name} to {relative_path}")
     
-def clean_data_to_format(data,source,sourceid,i):
+def clean_data_to_format(data,source,path):
     if source.lower()=='jira':
-        cleaned_data=clean_jira(data,sourceid,i)
+        cleaned_data, filename = clean_jira(data,path)
     elif source.lower()=='intercom':
-        cleaned_data=clean_intercom(data,sourceid,i)
+        cleaned_data, filename = clean_intercom(data,path)
+    elif source.lower()=='meet':
+        cleaned_data, filename = clean_meet(data,path)
+    elif source.lower()=='zoom':
+        cleaned_data, filename = clean_zoom(data,path)
     else:
         return {"message":"Source not found"}
-    return cleaned_data
-
-# path = "./store/"
-
-chain_collection={}
+    return cleaned_data, filename
 
 model_name = "sentence-transformers/all-MiniLM-L6-v2"
-model_kwargs = {'device': 'cuda'}
+# model_kwargs = {'device': 'cuda'}
+model_kwargs = {'device': 'cpu'}
 encode_kwargs = {'normalize_embeddings': False}
-
 
 embeddings = HuggingFaceEmbeddings(
     model_name=model_name,
@@ -104,10 +160,8 @@ embeddings = HuggingFaceEmbeddings(
     encode_kwargs=encode_kwargs
 )
 
-def save_embeddings(sourceid,localpath):
-    # DRIVE_FOLDER = "/content/drive/MyDrive/lang_data/Real_jsons"
-    # DRIVE_FOLDER = "/content/drive/MyDrive/lang_data"
-    DRIVE_FOLDER =localpath
+def save_embeddings(companyid,customerid):
+    DRIVE_FOLDER ='./'+companyid+'/'+customerid+'/'
     loader_json = DirectoryLoader(DRIVE_FOLDER, glob='**/*.json', show_progress=True, loader_cls=TextLoader)
     loaders = [loader_json]
     documents = []
@@ -116,26 +170,94 @@ def save_embeddings(sourceid,localpath):
     char_text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
     split_docs = char_text_splitter.split_documents(documents)
     vector_store = FAISS.from_documents(split_docs, embeddings)
-    # flnm = filename.split(".")[0]
-    folder_path = sourceid + "_faiss_index"
-    vector_store.save_local(folder_path)
+    shutil.rmtree(DRIVE_FOLDER)
+    temp = DRIVE_FOLDER+companyid+'_'+customerid+'_faiss_index/'
+    vector_store.save_local(temp)
     print("Embeddings saved")
-    shutil.rmtree(localpath)
-    return folder_path
+    return temp[2:]
 
-def merge(localpath,folderpath):
-  db1 = FAISS.load_local(localpath, embeddings)
-  db2 = FAISS.load_local(folderpath, embeddings)
-  db1.merge_from(db2)
-  try:
-      shutil.rmtree(localpath)
-      shutil.rmtree(folderpath)
-  except OSError as e:
-      print("Error: %s - %s." % (e.filename, e.strerror))
-  db1.save_local(folderpath)
-  return folderpath
+def query_data(companyid,customerid,source):
+  query = {'companyid':companyid,'customerid':customerid}
+  existing_data = target_data_collection.find_one(query)
+  data = existing_data['data']
+  for i in range(len(data)):
+    if data[i]['source']==source.lower():
+      j_data = data[i]['data']
+      return j_data
+
+'''------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------'''
+'''------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------'''
+'''------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------'''
+'''------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------'''
+'''------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------'''
+
+chain_collection={}
+vector_store_collection={}
+
+llm = ChatOpenAI(model_name="gpt-3.5-turbo-0613", temperature=0, max_tokens=512, verbose=True)#, device="cuda")  # Modify model_name if you have access to GPT-4
+
+
+def initialize(companyid, customerid):
+  id = companyid+'_'+customerid
+
+  template="""You are a CEO of SaaS company and also a health score predictor of SaaS customers.
+        As a CEO provide concise and on point answers relating to asked question.
+        Health score methodology: Study complete data and then apply this logic, score will be very low(from 0 to 3) if majority of high priority important issues are not resolved, score will be moderate(from 4 to 7) if we are able to resolve important issues but not all issues and score will be on higher side(from 8 to 10) only if we have resolved most of the issues including all priority issues.
+        At last give a specific number for health score in the format of - The health score of the customer would be i . Use the following pieces of context to answer the users question.
+        Before giving the answer go through all the provided data such that there is information in the memory from all sorts of data.
+        If you don't know the answer, don't try to make up an answer.
+
+        {context}
+
+        {chat_history}
+        Human: {human_input}
+        Chatbot:
+        """
+
+
+  prompt = PromptTemplate(input_variables=["chat_history", "human_input", "context"], template=template)
+
+  memory = ConversationBufferMemory(memory_key="chat_history", input_key="human_input")
+  foldername = companyid+'/'+customerid+'/'+companyid+'_'+customerid+'_faiss_index'
+  download_embeddings_folder_from_bucket(foldername,bucket_path_embeddings)
+  filepath=companyid+'_'+customerid+'_faiss_index'
+  vector_store = FAISS.load_local(filepath, embeddings)
+  vector_store_collection[id]=vector_store
+  shutil.rmtree(filepath)
+  chain = load_qa_chain(
+      llm=llm,
+      chain_type="stuff",
+      memory=memory,
+      prompt=prompt)
+
+  print(" chain initialized: " + str(id))
+  chain_collection[str(id)] = chain
+  print(chain_collection.keys())
+
+
+def output(query, companyid, customerid):
+  id = companyid+'_'+customerid
+  logging.getLogger("openai").setLevel(logging.DEBUG)
+  chain =  chain_collection[str(id)]
+  vector_store=vector_store_collection[id]
+  doc=vector_store.similarity_search(query)
+
+  with get_openai_callback() as cb:
+    result=chain({"input_documents": doc, "human_input": query}, return_only_outputs=False)
+    tokens_used=cb.total_tokens
+
+  return [query , result['output_text'], tokens_used]
+
+def qa(query, companyid,customerid):
+    answer = output(query, companyid, customerid)
+    print(f"query:{answer[0]}")
+    print(f"Answer:{answer[1]}")
+    print(f"Tokens used:{answer[2]}")
+    data = {"query":answer[0],"answer":answer[1],"tokens_used":answer[2]}
+    return data
 
 from fastapi import FastAPI, Request
+import uvicorn
 
 app = FastAPI() 
 
@@ -144,87 +266,52 @@ async def health():
     return {"message": 'healthy'}
 
 @app.post('/contextai/embeddings')
-async def saving(request: Request):
+async def saving_data(request: Request):
     body = await request.json()  
     companyid = body['companyid']  
-    source = body['source']
-    conversationid = body['conversationid']
-    sourceid = str(get_id(companyid,source))
-    data = get_data(sourceid)
-    cleaned_data, filename = clean_data_to_format(data,source,sourceid,i=1)
-    ##upload_data_to_mongo(cleaned_data)
-    upload_file_to_bucket(filename)
-    folder_path = save_embeddings(sourceid,'./jsons/')
-    upload_folder_to_bucket(folder_path)
+    customerid = body['customerid']
+    source = body['source'] 
+    data, path = get_data(companyid,customerid)
+    _, filename = clean_data_to_format(data,source,path)
+    upload_file_to_bucket(filename,bucket_path_jsons)
+    foldername=companyid+'/'+customerid+'/'
+    download_jsons_folder_from_bucket(foldername,bucket_path_jsons)
+    format_data = mongo_format(foldername)
+    mongo_update(companyid,customerid,format_data)
+    embeddings_path = save_embeddings(companyid,customerid)
+    upload_folder_to_bucket(embeddings_path,bucket_path_embeddings)
+    return {"message":"Data Successfully uploaded and Embeddings Saved Successfully for companyid: {} and customerid: {}".format(companyid,customerid)}
+    # return {"message":"Data Successfully uploaded of source: {} for companyid: {} and customerid: {}".format(source,companyid,customerid)}
 
-@app.post('/contextai/update')
-async def update(request: Request):
+# @app.post('/contextai/embeddings')
+# async def saving_embeddings(request: Request):
+#     body = await request.json()  
+#     companyid = body['companyid']  
+#     customerid = body['customerid']
+#     foldername=companyid+'/'+customerid+'/'
+#     download_jsons_folder_from_bucket(foldername,bucket_path_jsons)
+#     format_data = mongo_format(foldername)
+#     mongo_update(companyid,customerid,format_data)
+#     embeddings_path = save_embeddings(companyid,customerid)
+#     upload_folder_to_bucket(embeddings_path,bucket_path_embeddings)
+#     return {"message":"Embeddings Saved Successfully for companyid: {} and customerid: {}".format(companyid,customerid)}
+
+@app.post('/contextai/initialize')
+async def initalizing_embeddings(request: Request):
     body = await request.json() 
     companyid = body['companyid']  
-    source = body['source'] 
-    conversationid = body['conversationid']
-    sourceid = str(get_id(companyid,source))
-    data = get_data(sourceid)
-    duplicate_path = download_file_from_bucket(filename)
-    f = open(duplicate_path)
-    older_data = json.loads(f)
-    f.close()
-    i = older_data.keys()[-1].split(" ")[1]
-    cleaned_data, filename = clean_data_to_format(data,source,sourceid,i+1)
-    folderpath = save_embeddings(sourceid,'./jsons/')
-    local_folder = sourceid+'_temp'
-    bucket_folder = sourceid + "_faiss_index"
-    download_folder_from_bucket(bucket_folder,local_folder)
-    folderpath = merge(local_folder,folderpath)
-    upload_folder_to_bucket(folderpath)
-    merged_data = {**older_data, **cleaned_data}
-    with open(filename, 'w') as file:
-        json.dumps(merged_data, file, indent=4)
-    os.remove(duplicate_path)
-    ##upload_data_to_mongo(merged_data)
-    upload_file_to_bucket(filename)
+    customerid = body['customerid']
+    initialize(companyid, customerid)
+    return {"message":"Initialization Successful for companyid: {} and customerid: {}".format(companyid,customerid)}
 
+@app.post('/contextai/query')
+async def query_answers(request: Request):
+    body = await request.json() 
+    companyid = body['companyid']  
+    customerid = body['customerid']
+    query = body['query']
+    answer = qa(query, companyid,customerid)
+    return answer
 
 if __name__ == "__main__":
     uvicorn.run("main:app",host = '0.0.0.0', port = 8000)
-
-
-
-from fastapi import FastAPI
-from fastapi.logger import logger
-from pydantic import BaseSettings
-import sys
-from pyngrok import ngrok
-
-class Settings(BaseSettings):
-    # ... The rest of our FastAPI settings
-
-    BASE_URL = "http://localhost:8000"
-    USE_NGROK = os.environ.get("USE_NGROK", "False") == "True"
-
-
-settings = Settings()
-
-
-def init_webhooks(base_url):
-    # Update inbound traffic via APIs to use the public-facing ngrok URL
-    pass
-
-
-# Initialize the FastAPI app for a simple web server
-app = FastAPI()
-
-if settings.USE_NGROK:
-    # pyngrok should only ever be installed or initialized in a dev environment when this flag is set
-
-    # Get the dev server port (defaults to 8000 for Uvicorn, can be overridden with `--port`
-    # when starting the server
-    port = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else 8000
-
-    # Open a ngrok tunnel to the dev server
-    public_url = ngrok.connect(port).public_url
-    logger.info("ngrok tunnel \"{}\" -> \"http://127.0.0.1:{}\"".format(public_url, port))
-
-    # Update any base URLs or webhooks to use the public ngrok URL
-    settings.BASE_URL = public_url
-    init_webhooks(public_url)
